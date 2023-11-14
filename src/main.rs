@@ -2,11 +2,12 @@
 #[macro_use]
 extern crate error_chain;
 extern crate itertools;
-extern crate rusoto_core;
-extern crate rusoto_s3;
+extern crate aws_sdk_s3;
 
-use rusoto_core::Region;
-use rusoto_s3::S3Client;
+use aws_config::meta::region::RegionProviderChain;
+
+use aws_types::region::Region;
+use aws_smithy_types;
 
 use itertools::Itertools;
 use tempfile::Builder;
@@ -24,8 +25,12 @@ use errors::*;
 mod git;
 mod gpg;
 mod s3;
+use tokio;
 
-quick_main!(run);
+#[tokio::main]
+async fn main() -> Result<()> {
+    run().await
+}
 
 struct Settings {
     //git_dir: PathBuf,
@@ -34,17 +39,12 @@ struct Settings {
     root: s3::Key,
 }
 
-fn run() -> Result<()> {
-    let region = if let Ok(endpoint) = env::var("S3_ENDPOINT") {
-        Region::Custom {
-            name: String::from("us-east-1"),
-            endpoint,
-        }
-    } else {
-        Region::default()
-    };
+async fn run() -> Result<()> {
+    let region = String::from("us-east-1"); // BUGBUG : deal with AWS_REGION or S3_ENDPOINT, or does the aws sdk handle that for us?
 
-    let s3 = S3Client::new(region);
+    let region_provider = RegionProviderChain::default_provider().or_else(Region::new(region));
+    let config = aws_config::from_env().region(region_provider).load().await;
+    let s3 = aws_sdk_s3::Client::new(&config);
 
     let mut args = env::args();
     args.next();
@@ -89,7 +89,7 @@ fn run() -> Result<()> {
         },
     };
 
-    cmd_loop(&s3, &settings)
+    cmd_loop(&s3, &settings).await
 }
 
 #[derive(Debug)]
@@ -124,7 +124,7 @@ impl RemoteRefs {
     }
 }
 
-fn fetch_from_s3(s3: &S3Client, settings: &Settings, r: &GitRef) -> Result<()> {
+async fn fetch_from_s3(s3: &aws_sdk_s3::Client, settings: &Settings, r: &GitRef) -> Result<()> {
     let tmp_dir = Builder::new()
         .prefix("s3_fetch")
         .tempdir()
@@ -137,7 +137,7 @@ fn fetch_from_s3(s3: &S3Client, settings: &Settings, r: &GitRef) -> Result<()> {
         bucket: settings.root.bucket.to_owned(),
         key: path,
     };
-    s3::get(s3, &o, &enc_file)?;
+    s3::get(s3, &o, &enc_file).await?;
 
     gpg::decrypt(&enc_file, &bundle_file)?;
 
@@ -146,7 +146,7 @@ fn fetch_from_s3(s3: &S3Client, settings: &Settings, r: &GitRef) -> Result<()> {
     Ok(())
 }
 
-fn push_to_s3(s3: &S3Client, settings: &Settings, r: &GitRef) -> Result<()> {
+async fn push_to_s3(s3: &aws_sdk_s3::Client, settings: &Settings, r: &GitRef) -> Result<()> {
     let tmp_dir = Builder::new()
         .prefix("s3_push")
         .tempdir()
@@ -172,12 +172,12 @@ fn push_to_s3(s3: &S3Client, settings: &Settings, r: &GitRef) -> Result<()> {
         bucket: settings.root.bucket.to_owned(),
         key: path,
     };
-    s3::put(s3, &enc_file, &o)?;
+    s3::put(s3, &enc_file, &o).await?;
 
     Ok(())
 }
 
-fn cmd_fetch(s3: &S3Client, settings: &Settings, sha: &str, name: &str) -> Result<()> {
+async fn cmd_fetch(s3: &aws_sdk_s3::Client, settings: &Settings, sha: &str, name: &str) -> Result<()> {
     if name == "HEAD" {
         // Ignore head, as it's guaranteed to point to a ref we already downloaded
         return Ok(());
@@ -186,12 +186,12 @@ fn cmd_fetch(s3: &S3Client, settings: &Settings, sha: &str, name: &str) -> Resul
         name: name.to_string(),
         sha: sha.to_string(),
     };
-    fetch_from_s3(s3, settings, &git_ref)?;
+    fetch_from_s3(s3, settings, &git_ref).await?;
     println!();
     Ok(())
 }
 
-fn cmd_push(s3: &S3Client, settings: &Settings, push_ref: &str) -> Result<()> {
+async fn cmd_push(s3: &aws_sdk_s3::Client, settings: &Settings, push_ref: &str) -> Result<()> {
     let force = push_ref.starts_with('+');
 
     let mut split = push_ref.split(':');
@@ -204,7 +204,7 @@ fn cmd_push(s3: &S3Client, settings: &Settings, push_ref: &str) -> Result<()> {
         bail!("src_ref != dst_ref")
     }
 
-    let all_remote_refs = list_remote_refs(s3, settings)?;
+    let all_remote_refs = list_remote_refs(s3, settings).await?;
     let remote_refs = all_remote_refs.get(src_ref);
     let prev_ref = remote_refs.map(|rs| rs.latest_ref());
     let local_sha = git::rev_parse(src_ref)?;
@@ -227,12 +227,12 @@ fn cmd_push(s3: &S3Client, settings: &Settings, push_ref: &str) -> Result<()> {
         };
 
     if can_push {
-        push_to_s3(s3, settings, &local_ref)?;
+        push_to_s3(s3, settings, &local_ref).await?;
 
         // Delete any ref that is an ancestor of the one we pushed
         for r in remote_refs.iter().flat_map(|r| r.by_update_time.iter()) {
             if git::is_ancestor(&local_ref.sha, &r.reference.sha)? {
-                s3::del(s3, &r.object)?;
+                s3::del(s3, &r.object).await?;
             }
         }
 
@@ -245,7 +245,7 @@ fn cmd_push(s3: &S3Client, settings: &Settings, push_ref: &str) -> Result<()> {
 
 // Implement protocol defined here:
 // https://github.com/git/git/blob/master/Documentation/gitremote-helpers.txt
-fn cmd_loop(s3: &S3Client, settings: &Settings) -> Result<()> {
+async fn cmd_loop(s3: &aws_sdk_s3::Client, settings: &Settings) -> Result<()> {
     loop {
         let mut input = String::new();
         io::stdin()
@@ -262,25 +262,25 @@ fn cmd_loop(s3: &S3Client, settings: &Settings) -> Result<()> {
         let arg2 = iter.next();
 
         match (cmd, arg1, arg2) {
-            (Some("push"), Some(ref_arg), None) => cmd_push(s3, settings, ref_arg),
-            (Some("fetch"), Some(sha), Some(name)) => cmd_fetch(s3, settings, sha, name),
-            (Some("capabilities"), None, None) => cmd_capabilities(),
-            (Some("list"), None, None) => cmd_list(s3, settings),
-            (Some("list"), Some("for-push"), None) => cmd_list(s3, settings),
+            (Some("push"), Some(ref_arg), None) => cmd_push(s3, settings, ref_arg).await,
+            (Some("fetch"), Some(sha), Some(name)) => cmd_fetch(s3, settings, sha, name).await,
+            (Some("capabilities"), None, None) => cmd_capabilities().await,
+            (Some("list"), None, None) => cmd_list(s3, settings).await,
+            (Some("list"), Some("for-push"), None) => cmd_list(s3, settings).await,
             (None, None, None) => return Ok(()),
-            _ => cmd_unknown(),
+            _ => cmd_unknown().await,
         }?
     }
 }
 
-fn cmd_unknown() -> Result<()> {
+async fn cmd_unknown() -> Result<()> {
     println!("unknown command");
     println!();
     Ok(())
 }
 
-fn list_remote_refs(s3: &S3Client, settings: &Settings) -> Result<HashMap<String, RemoteRefs>> {
-    let result = s3::list(s3, &settings.root)?;
+async fn list_remote_refs(s3: &aws_sdk_s3::Client, settings: &Settings) -> Result<HashMap<String, RemoteRefs>> {
+    let result = s3::list(s3, &settings.root).await?;
     let objects = match result.contents {
         Some(l) => l,
         None => vec![],
@@ -303,7 +303,7 @@ fn list_remote_refs(s3: &S3Client, settings: &Settings) -> Result<HashMap<String
                             bucket: settings.root.bucket.to_owned(),
                             key: k,
                         },
-                        updated: o.last_modified.unwrap(),
+                        updated: o.last_modified.unwrap().fmt(aws_smithy_types::date_time::Format::DateTime).unwrap(),
                         reference: GitRef { name, sha },
                     },
                 )
@@ -327,8 +327,8 @@ fn sorted_remote_refs(refs: Vec<RemoteRef>) -> RemoteRefs {
     }
 }
 
-fn cmd_list(s3: &S3Client, settings: &Settings) -> Result<()> {
-    let refs = list_remote_refs(s3, settings)?;
+async fn cmd_list(s3: &aws_sdk_s3::Client, settings: &Settings) -> Result<()> {
+    let refs = list_remote_refs(s3, settings).await?;
     if !refs.is_empty() {
         for (_name, refs) in refs.iter() {
             let mut iter = refs.by_update_time.iter();
@@ -353,7 +353,7 @@ fn cmd_list(s3: &S3Client, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-fn cmd_capabilities() -> Result<()> {
+async fn cmd_capabilities() -> Result<()> {
     println!("*push");
     println!("*fetch");
     println!();
